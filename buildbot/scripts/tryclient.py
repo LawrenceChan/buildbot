@@ -1,11 +1,12 @@
 # -*- test-case-name: buildbot.test.test_scheduler,buildbot.test.test_vc -*-
 
-import sys, os, re, time, random
-from twisted.internet import utils, protocol, defer, reactor, task
+import sys, os, re, time, random, getpass
+from twisted.internet import utils, protocol, defer, reactor, task, ssl
 from twisted.spread import pb
 from twisted.cred import credentials
 from twisted.python import log
 from twisted.python.procutils import which
+from twisted.spread.pb import PBClientFactory
 
 from buildbot.sourcestamp import SourceStamp
 from buildbot.scripts import runner
@@ -373,6 +374,11 @@ class BuildSetStatusGrabber:
         d.addCallback(self.go)
         reactor.callLater(self.retryDelay, d.callback, None)
 
+class ClearPBClientFactory(PBClientFactory):
+    def _cbResponse(self, (challenge, challenger), password, client):
+        print "Responding"
+        return challenger.callRemote("respond", password, client)
+    
 
 class Try(pb.Referenceable):
     buildsetStatus = None
@@ -475,12 +481,25 @@ class Try(pb.Referenceable):
         if self.connect == "pb":
             user = self.getopt("username", "try_username")
             passwd = self.getopt("passwd", "try_password")
+            if not passwd:
+                passwd = getpass.getpass("Password: ")
             master = self.getopt("master", "try_master")
             tryhost, tryport = master.split(":")
             tryport = int(tryport)
-            f = pb.PBClientFactory()
+            tryauth = self.getopt("tryauth", "try_auth")
+            if not tryauth:
+                tryauth = "normal"
+                
+            if tryauth == "ldap":
+                f = ClearPBClientFactory()
+            else:
+                f = PBClientFactory()
             d = f.login(credentials.UsernamePassword(user, passwd))
-            reactor.connectTCP(tryhost, tryport, f)
+            if tryauth == "ldap":
+                cCTX = ssl.ClientContextFactory()
+                reactor.connectSSL(tryhost, tryport, f, cCTX)
+            else:
+                reactor.connectTCP(tryhost, tryport, f)
             d.addCallback(self._deliverJob_pb)
             return d
         raise RuntimeError("unknown connecttype '%s', should be 'ssh' or 'pb'"

@@ -2,13 +2,15 @@
 
 import time, os.path
 
-from zope.interface import implements
-from twisted.internet import reactor
+from zope.interface import implements, Interface, Attribute
+from twisted.internet import reactor, defer
 from twisted.application import service, internet, strports
-from twisted.python import log, runtime
+from twisted.python import log, runtime, failure
 from twisted.protocols import basic
-from twisted.cred import portal, checkers
+from twisted.cred import portal, checkers, credentials, error
 from twisted.spread import pb
+from twisted.spread.pb import _PortalAuthChallenger, _PortalWrapper, _PortalRoot, challenge
+from twisted.cred.checkers import ICredentialsChecker
 
 from buildbot import interfaces, buildset, util, pbutil
 from buildbot.status import builder
@@ -770,6 +772,69 @@ class Try_Userpass(TryBase):
         assert interface == pb.IPerspective
         p = Try_Userpass_Perspective(self, avatarID)
         return (pb.IPerspective, p, lambda: None)
+
+class LDAPChecker:
+    """
+    A somewhat better credentials checker that uses ldap
+    
+    Requires the python ldap module (http://www.python-ldap.org/)
+    """
+    implements(ICredentialsChecker)
+
+    credentialInterfaces = (credentials.IUsernamePassword,
+                            credentials.IUsernameHashedPassword)
+
+    def __init__(self, ldapServer, baseDn, uidMask):
+        self.ldapServer = ldapServer
+        self.baseDn = baseDn
+        self.uidMask = uidMask
+
+    def requestAvatarId(self, c):
+        import ldap
+        try:
+            ldapo = ldap.initialize(self.ldapServer)
+            ldapo.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+            search = ldapo.search_s(self.baseDn, 1, self.uidMask % c.username)
+            ldapo.bind_s(search[0][0], c.response)
+            return defer.succeed(c.username)
+        except Exception, e:
+            print e
+        return defer.fail(error.UnauthorizedLogin())
+
+#Reimplement some portal stuff to not do digests and be less annoying
+class _ClearPortalAuthChallenger(_PortalAuthChallenger):
+    implements(credentials.IUsernamePassword)
+
+    def checkPassword(self, password):
+        """Shouldn't be used"""
+        return False
+
+class _ClearPortalWrapper(_PortalWrapper):
+    def remote_login(self, username):
+        return None, _ClearPortalAuthChallenger(self.portal, self.broker, username, None)
+
+class _ClearPortalRoot(_PortalRoot):
+    def rootObject(self, broker):
+        return _ClearPortalWrapper(self.portal, broker)
+
+class Try_UserpassLDAP(Try_Userpass):
+    """
+    Uses the LDAP password checker.  This requires that passwords be sent unhashed, and so it uses SSL connections,
+    which requires PyOpenSSL (or rather, twisted requires PyOpenSSL for SSL support)
+    """
+    def __init__(self, name, builderNames, port, privateKey, serverKey, ldapServer, base_dn, uid_mask, properties={}):
+        TryBase.__init__(self, name, builderNames, properties)
+        if type(port) is int:
+            port = "ssl:%d:privateKey=%s:certKey=%s" % (port, privateKey, serverKey)
+        self.port = port
+        
+        c = LDAPChecker(ldapServer, base_dn, uid_mask)
+        p = portal.Portal(self)
+        p.registerChecker(c)
+        cp = _ClearPortalRoot(p)
+        f = pb.PBServerFactory(cp)
+        s = strports.service(port, f)
+        s.setServiceParent(self)
 
 class Try_Userpass_Perspective(pbutil.NewCredPerspective):
     def __init__(self, parent, username):
